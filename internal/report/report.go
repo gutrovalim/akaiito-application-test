@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gutrovalim/akaiito-application-test/internal/captures"
 	"github.com/gutrovalim/akaiito-application-test/internal/ledger"
 	"github.com/gutrovalim/akaiito-application-test/internal/oracle"
 	"github.com/gutrovalim/akaiito-application-test/internal/scenario"
@@ -66,7 +67,12 @@ func Build(dir string) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	o0, _ := oracle.Validity(sc, rows)
+	caps, err := captures.ReadTraces(filepath.Join(abs, "recorder"))
+	if err != nil {
+		return nil, err
+	}
+	o0, kept := oracle.Validity(sc, rows)
+	o1, o1v := oracle.Truth(sc, o0, kept, caps)
 	verdict := oracle.Pass
 	if o0.Verdict == oracle.Invalid {
 		verdict = oracle.Invalid
@@ -78,8 +84,14 @@ func Build(dir string) (*Report, error) {
 		Mode:       "baseline",
 		Stack:      stack,
 		Verdict:    verdict,
-		Tiers:      Tiers{O0: o0, O1: reported(), O1v: reported(), O2: reported(), Rung2: reported()},
-		Facts:      map[string]any{},
+		Tiers: Tiers{
+			O0:    o0,
+			O1:    Tier{Verdict: oracle.Reported, Truth: oracle.AsMap(o1)},
+			O1v:   Tier{Verdict: oracle.Reported, Truth: oracle.AsMap(o1v)},
+			O2:    reported(),
+			Rung2: reported(),
+		},
+		Facts: map[string]any{},
 	}, nil
 }
 

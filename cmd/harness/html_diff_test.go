@@ -92,8 +92,11 @@ func TestDiffPerTier(t *testing.T) {
 	t.Run("differ", func(t *testing.T) {
 		_, m := diff(a, b)
 		tiers := get(t, m, "tiers").(map[string]any)
-		if len(tiers) != 1 {
-			t.Errorf("tiers = %v, want only O0", tiers)
+		if _, ok := tiers["O0"]; !ok {
+			t.Fatalf("tiers = %v, want O0", tiers)
+		}
+		if _, ok := tiers["O1"]; ok {
+			t.Errorf("tiers = %v: O1 has no difference and must be omitted", tiers)
 		}
 		v, _ := json.Marshal(get(t, tiers, "O0", "verdict"))
 		if string(v) != `["PASS","INVALID"]` {
