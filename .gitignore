@@ -33,3 +33,4 @@ go.work.sum
 
 # Run artifacts
 runs/
+apps/java/target/
