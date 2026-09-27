@@ -37,6 +37,13 @@ func TestK0(t *testing.T) {
 	check(t, countFiles(t, filepath.Join(first, "recorder")) > 0, "no recorder captures")
 	check(t, countFiles(t, filepath.Join(first, "intake")) > 0, "no intake captures")
 
+	// C24: the control reports no certain orphans, and every ledger span reached the recorder.
+	// The second half is only true because the apps raise their tracer rate limit: the ledger
+	// client's own HTTP posts are traced, so the default 100 traces/s drops whole traces at
+	// 50 msg/s and both sides of a dropped trace vanish together.
+	check(t, r.Tiers.O1.Truth.Total == 0, "O1 certain orphans = %d, want 0", r.Tiers.O1.Truth.Total)
+	check(t, r.Tiers.O1.Truth.Uncaptured == 0, "O1 uncaptured = %d, want 0 (a dropped trace reads as lost propagation)", r.Tiers.O1.Truth.Uncaptured)
+
 	// C15: the body marker is never carried in headers, and every consumed seq came from the producer.
 	producer := readLedger(t, first, "akt-producer")
 	consumer := readLedger(t, first, "akt-consumer")

@@ -24,6 +24,12 @@ const (
 	JavaImage     = "akt-java:local"
 	DataDir       = "/data"
 	Bootstrap     = "kafka:9092"
+	// RateLimit is the apps' tracer rate limit. The default of 100 traces/s is low enough
+	// for a bench to trip: the ledger client's own HTTP posts are traced, so a 50 msg/s
+	// scenario offers about 100 traces/s and the limiter drops whole traces. A drop at the
+	// tracer propagates, so both sides of that trace disappear and the run looks like lost
+	// propagation rather than a limiter artifact.
+	RateLimit = "100000"
 )
 
 // DefaultVersions is the tracer version used when a topology entry names none.
@@ -285,6 +291,7 @@ func Compose(sc *scenario.Scenario, runID, runDir string) (*File, error) {
 			"DD_TRACE_AGENT_PORT":                         "8126",
 			"DD_TRACE_OTEL_ENABLED":                       "true",
 			"DD_TRACE_SAMPLE_RATE":                        rate,
+			"DD_TRACE_RATE_LIMIT":                         RateLimit,
 			"DD_DATA_STREAMS_ENABLED":                     "false",
 			"DD_TRACE_128_BIT_TRACEID_GENERATION_ENABLED": "true",
 			"DD_INSTRUMENTATION_TELEMETRY_ENABLED":        "false",

@@ -79,7 +79,8 @@ type report struct {
 		O1 struct {
 			Verdict string `json:"verdict"`
 			Truth   struct {
-				Total int `json:"total"`
+				Total      int `json:"total"`
+				Uncaptured int `json:"uncaptured"`
 			} `json:"truth"`
 		} `json:"O1"`
 	} `json:"tiers"`
