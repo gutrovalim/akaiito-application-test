@@ -11,7 +11,7 @@ Sources:
 
 - #14 real Datadog mode, #21 facts - no real `DD_API_KEY` in env; the last criterion of #14 cannot be proven
 - #15 to #20, #26 to #28 - need `LOCALSTACK_AUTH_TOKEN`, not in env
-- #22 to #25, #29 to #36 - need an Akai Ito container; `~/repos/akaiito` has no code
+- #22 to #25, #29 to #36 - need an Akaiito container; `~/repos/akaiito` has no code
 - Scoring O1 to O5 - baseline scores only O0 (Design §7); O1, O1v, O2 and rung-2 truths are computed and reported with verdict `REPORTED`
 - O3a/O3b/O5 truth beyond the rung-2 candidate set of #10
 - CI; `git push` of commits or the `fixtures-v1` tag (needs an explicit go-ahead)
@@ -265,7 +265,7 @@ Proof: `git rev-parse fixtures-v1^{commit}` equals `git log -1 --format=%H -- fi
 ## Swept
 
 - validation: C6, C35 (scenario); C11 (ledger body)
-- failure modes: C2, C3 (incomplete ledger -> INVALID, never an Akai Ito failure); C23 (uncaptured spans)
+- failure modes: C2, C3 (incomplete ledger -> INVALID, never an Akaiito failure); C23 (uncaptured spans)
 - idempotency and retry: C4 (dedup, redelivery); C17 (ledger retries)
 - authorization: not in scope - local tool; key hygiene covered by C10, C38
 - concurrency and ordering: C4 (at-least-once consumers); runs isolated per compose project name = run_id (C13)
@@ -319,7 +319,7 @@ Greenfield, so sizes are estimates of what each slice writes plus the proto pack
 - Facts for B3's decoder (measured on dd-java 1.66.0 + agent 7.83.2, zstd bodies):
   - `trace.Span.TraceID` is the low 64 bits and `Meta["_dd.p.tid"]` the high 64; the ledger's 128-bit ID matched captures exactly.
   - The numeric tags live in `Span.Metrics`, not `Meta`: the Kafka consumer carries `#partition`, `#offset` and `#record.queue_time_ms`, and the producer carries `#partition` and `#offset`. A decoder that reads only `Meta` sees no join keys at all.
-  - **dd-java 1.66.0 records partition and offset on the Kafka producer span**, which the design says it does not (AI §6.3's upstream PR appears to be in). K2's dd-java variant is therefore repairable by rung 1, not "rung 2 only" as issue #6 expects - raised with the user before B4.
+  - **dd-java 1.66.0 records partition and offset on the Kafka producer span**, which the design says it does not (Akaiito §6.3's upstream PR appears to be in). K2's dd-java variant is therefore repairable by rung 1, not "rung 2 only" as issue #6 expects - raised with the user before B4.
   - The ledger's producer span is the app's `akt.send` wrapper and the consumer's is `kafka.consume`; the messaging-producer span (`kafka.produce`) is a child of `akt.send`, so "the true producer span" is that child. Healthy propagation puts `kafka.consume`'s parent at the producer's `kafka.produce`: 0 dangling parents on K0.
   - Captures also contain spans outside the ledger (the consumer's own ledger POSTs appear as `http.request` spans), so the oracle must key on ledger rows rather than assume every captured span is one.
   - The agent does not emit the `idx` variant for these tracers yet, so C19's idx path needs a hand-built fixture rather than a K0 capture.
