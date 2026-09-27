@@ -17,21 +17,22 @@ type NativeID struct {
 }
 
 type Row struct {
-	RunID         string    `json:"run_id"`
-	ScenarioID    string    `json:"scenario_id"`
-	Seq           int64     `json:"seq"`
-	Side          string    `json:"side"`
-	ParentSeq     *int64    `json:"parent_seq,omitempty"`
-	Service       string    `json:"service"`
-	Language      string    `json:"language"`
-	Tracer        string    `json:"tracer"`
-	TracerVersion string    `json:"tracer_version"`
-	Broker        string    `json:"broker"`
-	Destination   string    `json:"destination"`
-	NativeID      *NativeID `json:"native_id,omitempty"`
-	TraceID       string    `json:"trace_id"`
-	SpanID        string    `json:"span_id"`
-	TsNS          int64     `json:"ts_ns"`
+	RunID           string    `json:"run_id"`
+	ScenarioID      string    `json:"scenario_id"`
+	Seq             int64     `json:"seq"`
+	Side            string    `json:"side"`
+	ParentSeq       *int64    `json:"parent_seq,omitempty"`
+	Service         string    `json:"service"`
+	Language        string    `json:"language"`
+	Tracer          string    `json:"tracer"`
+	TracerVersion   string    `json:"tracer_version"`
+	Broker          string    `json:"broker"`
+	Destination     string    `json:"destination"`
+	NativeID        *NativeID `json:"native_id,omitempty"`
+	TraceID         string    `json:"trace_id"`
+	SpanID          string    `json:"span_id"`
+	TsNS            int64     `json:"ts_ns"`
+	MarkerInHeaders bool      `json:"marker_in_headers,omitempty"`
 }
 
 const (

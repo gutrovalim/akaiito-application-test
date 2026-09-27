@@ -30,6 +30,9 @@ type O0 struct {
 	TrueProducers map[string]string `json:"true_producers"`
 }
 
+// SeqBase is the seq prefix of topology entry i: its n-th message has seq SeqBase(i)+n.
+func SeqBase(i int) int64 { return int64(i) * 1_000_000 }
+
 // Validity runs the O0 gate: every seq read or re-produced has a writer row, and every
 // entry subscribed to a destination has a read row for each seq written to it.
 // It returns the deduped ledger alongside the verdict.
@@ -84,8 +87,32 @@ func Validity(s *scenario.Scenario, rows []ledger.Row) (O0, []ledger.Row) {
 			}
 		}
 	}
+	expected := map[int64]scenario.Entry{}
+	n := s.Traffic.Messages
+	for _, p := range s.Traffic.Phases {
+		n += p.Messages
+	}
+	for i, e := range s.Topology {
+		if e.Role != scenario.Producer {
+			continue
+		}
+		for k := 1; k <= n; k++ {
+			seq := SeqBase(i) + int64(k)
+			expected[seq] = e
+			if _, ok := writers[seq]; !ok {
+				if _, ok := missingWriter[seq]; !ok {
+					missingWriter[seq] = e.Topic
+				}
+			}
+		}
+	}
 	for seq, dest := range missingWriter {
 		m := Missing{Seq: seq, Side: ledger.Producer, Destination: dest}
+		if e, ok := expected[seq]; ok {
+			m.Service, m.Destination = e.Service, e.Topic
+			o.Missing = append(o.Missing, m)
+			continue
+		}
 		var ws []string
 		for _, e := range s.Topology {
 			if dest != "" && (e.Role == scenario.Producer && e.Topic == dest || e.Role == scenario.Bridge && e.To == dest) {

@@ -25,7 +25,7 @@ broker: kafka
 topology:
   - {role: producer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
   - {role: consumer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
-traffic: {messages: 3, rate_per_s: 10}
+traffic: {messages: 2, rate_per_s: 10}
 expect: {O0: PASS}
 `
 

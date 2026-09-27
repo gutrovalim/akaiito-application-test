@@ -168,3 +168,50 @@ func TestReportRejectsInvalidScenario(t *testing.T) {
 		})
 	}
 }
+
+func TestReportO0ExpectedSeqsFromTraffic(t *testing.T) {
+	three := strings.Replace(k0Scenario, "messages: 2", "messages: 3", 1)
+	phased := `id: k0-phased
+broker: kafka
+topology:
+  - {role: consumer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
+  - {role: producer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
+traffic:
+  phases: [{messages: 2, rate_per_s: 5}, {messages: 1, rate_per_s: 50}]
+`
+	cases := []struct {
+		name, scenario string
+		rows           []row
+		want           []map[string]any
+	}{
+		{"messages, last seq unwritten", three, k0Rows([]int64{1, 2}, []int64{1, 2}),
+			[]map[string]any{{"seq": 3.0, "side": "producer", "service": "akt-producer", "destination": "orders"}}},
+		{"messages, producer wrote nothing", three, nil,
+			[]map[string]any{
+				{"seq": 1.0, "side": "producer", "service": "akt-producer", "destination": "orders"},
+				{"seq": 2.0, "side": "producer", "service": "akt-producer", "destination": "orders"},
+				{"seq": 3.0, "side": "producer", "service": "akt-producer", "destination": "orders"},
+			}},
+		{"phases, producer at index 1", phased, k0Rows([]int64{1_000_001, 1_000_002}, []int64{1_000_001, 1_000_002}),
+			[]map[string]any{{"seq": 1_000_003.0, "side": "producer", "service": "akt-producer", "destination": "orders"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rep := runReport(t, writeRun(t, runID, tc.scenario, tc.rows))
+			if got := get(t, rep, "tiers", "O0", "verdict"); got != "INVALID" {
+				t.Errorf("tiers.O0.verdict = %v, want INVALID", got)
+			}
+			m := missingEntries(t, rep)
+			if len(m) != len(tc.want) {
+				t.Fatalf("tiers.O0.missing = %v, want %v", m, tc.want)
+			}
+			for i, w := range tc.want {
+				for k, v := range w {
+					if m[i][k] != v {
+						t.Errorf("missing[%d].%s = %v, want %v", i, k, m[i][k], v)
+					}
+				}
+			}
+		})
+	}
+}
