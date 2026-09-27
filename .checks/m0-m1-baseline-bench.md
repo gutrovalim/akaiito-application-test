@@ -1,0 +1,282 @@
+# M0 + M1: baseline bench (Kafka, Java and Go, fixtures-v1)
+
+Sources:
+
+- https://github.com/gutrovalim/akaiito-application-test/issues/1 - spec: modules, contracts (LedgerRow, body marker, seq, 128-bit rule, dedup key, report.json, manifest), testing seams
+- issues #2 to #13 - one slice each, acceptance criteria below carry them verbatim or sharpened
+- `Design.md` - decisions T1 to T23, ledger (§5.2), oracle tiers (§7), fixtures (§8), open facts (§10)
+- `~/repos/akaiito/Design.md` §5.1, §6, §7 - what "repairable", rung 1 and rung 2 mean (the truth mirrors them)
+
+## Out of scope
+
+- #14 real Datadog mode, #21 facts - no real `DD_API_KEY` in env; the last criterion of #14 cannot be proven
+- #15 to #20, #26 to #28 - need `LOCALSTACK_AUTH_TOKEN`, not in env
+- #22 to #25, #29 to #36 - need an Akai Ito container; `~/repos/akaiito` has no code
+- Scoring O1 to O5 - baseline scores only O0 (Design §7); O1, O1v, O2 and rung-2 truths are computed and reported with verdict `REPORTED`
+- O3a/O3b/O5 truth beyond the rung-2 candidate set of #10
+- CI; `git push` of commits or the `fixtures-v1` tag (needs an explicit go-ahead)
+
+## Landing
+
+One Go module at the root (`github.com/gutrovalim/akaiito-application-test`): `cmd/harness` (CLI), `cmd/services` (recorder, fake intake, ledger collector, fake metrics sink in one binary and one image), `internal/...`. Payload decoding reuses `github.com/DataDog/datadog-agent/pkg/proto` `pbgo/trace` and `pbgo/trace/idx` (v0.83.2) rather than a hand-written decoder. Java app under `apps/java` (Maven, Java 21), Go app under `apps/go` (its own module, so tracer deps stay out of the harness).
+
+| One-way door | Literal shape | Alternative rejected |
+| --- | --- | --- |
+| CLI | `harness run <scenario.yaml> [--runs-dir runs]`, `harness report <run_dir>` (writes `report.json` then `report.html`), `harness diff <a/report.json> <b/report.json>` (JSON to stdout), `harness record <scenario.yaml> [--fixtures-dir fixtures]` | `report --diff` flag - diff has two inputs and no run dir |
+| Run directory | `runs/<run_id>/{scenario.yaml, stack.json, ledger/<service>.jsonl, recorder/<NNNNNN>.{meta.json,body}, intake/<NNNNNN>.{meta.json,body}, report.json, report.html}`; `run_id` = `<scenario_id>-<UTC yyyymmddThhmmssZ>-<4 hex>` | one JSONL for all captures - body bytes must stay byte-exact, base64 in JSONL doubles fixture size |
+| Capture meta | `{"seq":n,"ts_ns":…,"method":"POST","path":"/api/v0.2/traces","headers":{…allowlisted only}}`; allowlist: `Content-Type`, `Content-Encoding`, `Datadog-Meta-Lang`, `Datadog-Meta-Lang-Version`, `Datadog-Meta-Tracer-Version`, `User-Agent`, `X-Datadog-Reported-Languages`, `Dd-Agent-Version` (case-insensitive) | denylist of credential headers - a new credential header would leak |
+| Ledger collector API | `POST /v1/rows`, body = JSON array of LedgerRow, `204` on success, `400` on undecodable body; appended to `ledger/<service>.jsonl` | one row per request - bursts at high rate cost a request per message |
+| LedgerRow JSON | snake_case per spec; `trace_id` 32 lowercase hex, `span_id` 16 lowercase hex; `native_id` = `{"partition":p,"offset":o}` or `{"message_id":"…"}`; `parent_seq` omitted unless `bridge_out`; `ts_ns` int64 | decimal Datadog IDs - OTel API and 128-bit IDs are hex-native; decimal hides the high 64 bits |
+| Body marker | `{"akt":{"run":"<run_id>","seq":<int>},"data":{…synthetic}}`; `seq` starts at 1 per producing app and is globally unique by prefixing: producer entry `i` uses `seq = i*1_000_000 + n` | a shared seq service - another moving part on the message path |
+| Scenario YAML | `id`, `broker`, `topology[]` (`name`, `role`, `lang`, `tracer`, `version`, `topic` or `from`/`to`, `forward_headers`, `sampling`, `clock_offset`, `env`), `topics{<name>: {partitions, config{}}}`, `traffic` (`messages`, `rate_per_s`) or `traffic.phases[]`, `expect` (`O0`, `O1.certain_orphans: from_truth|<int>`, `O2{tolerance, window_ms, lookahead_ms}`, `rung2{candidate_window_ms}`); unknown keys rejected | loose map - "invalid scenario rejected with a clear error" needs a closed schema |
+| report.json | `{"schema":1,"run_id","scenario_id","mode":"baseline","stack":{…},"verdict":"PASS|FAIL|INVALID","tiers":{"O0":{"verdict","missing":[…],"deduped":n},"O1":{"verdict":"REPORTED","truth":{…}},"O1v":…,"O2":…,"rung2":…},"facts":{…}}`; verdict tokens `PASS`, `FAIL`, `INVALID`, `REPORTED` | per-tier files - the diff and the HTML want one document |
+| Fixture set | `fixtures/<scenario_id>/{manifest.json, scenario.yaml, recorder/…, ledger/…}`; manifest `{"schema":1,"scenario_id","tracers":[{service,tracer,version}],"agent_version","run_id","o0","truth":{O1,O1v,O2,rung2}}` | copying `report.json` as the manifest - it carries paths and verdicts the contract tests must not depend on |
+| Producer span ref | producer app wraps each send in its own span `akt.send` (via the tracer's API); the ledger records that span; the "true producer span" in captures is the messaging-producer child of it in the same trace | recording the tracer's produce span - its ID is not reachable from app code for dd-java |
+| Consumer span ref | the span current inside the per-record iteration (`Span.current()` / tracer equivalent) | span current at `poll()` return - OTel receive span has ended by then (Design §5.2) |
+| Repairable truth | an O1 orphan is `rung1` when its captured span and its true producer span both carry the ledger `(partition, offset)`; else `rung2` when the consumer carries `record_queue_time_ms` and the true producer span's `[start, end]` contains `consumer.start - record_queue_time_ms` widened by `rung2.candidate_window_ms`; else `not_repairable` | "consumer has any join key" - counts keys that match nothing |
+| Headerless bridge | `forward_headers: false` = new `ProducerRecord` with no headers **and** the tracer's own Kafka propagation disabled on the bridge (`DD_KAFKA_CLIENT_PROPAGATION_ENABLED=false`, `OTEL_INSTRUMENTATION_KAFKA_PRODUCER_PROPAGATION_ENABLED=false`) | not copying headers only - the tracer re-injects its own, so nothing breaks |
+| Default sampling | every app runs with 100% keep (`DD_TRACE_SAMPLE_RATE=1.0` / `OTEL_TRACES_SAMPLER=always_on`) unless the scenario sets `sampling` | agent default rates - silently drop healthy traces and make controls noisy |
+| Pinned versions | agent `datadog/agent:7.83.2`, Kafka `apache/kafka:4.3.1`, dd-java `1.66.0`, OTel Java agent `2.31.1`, `kafka-clients 4.3.1`; every new dependency at least 7 days old | `latest` - T14 forbids it |
+| Go app tracers | Kafka via `IBM/sarama`; dd-trace-go v2 `contrib/IBM/sarama`, OTel via `github.com/dnwe/otelsarama`; tracer picked by `AKT_TRACER` env at init | confluent-kafka-go - cgo and librdkafka on arm64 images |
+
+- Nothing else in this change is hard to reverse
+
+## Test policy (declared by #1 "Testing Decisions"; restated so each row gets a verdict)
+
+| Code | Required proofs | Coverage expectation |
+| --- | --- | --- |
+| Oracle, validity gate, trace-ID normalization, dedup, report writer, diff (decide; reached through `harness report`/`harness diff`) | seam 1: Go tests that call the CLI entry (`harness.Main(args)`) on hand-built run dirs under `testdata/` and assert only on `report.json` / diff output | one asserted case per row of each decision table named in Coverage |
+| Scenario loader (decides: accept/reject) | seam 1 | each rejection class in Coverage |
+| Stack composer, apps, recorder, fake intake, ledger collector, break injection | seam 2: `go test -tags e2e ./e2e` running `harness run` against the real compose stack | the scenario's asserted `report.json` values |
+| Recorder header allowlist, ledger collector HTTP contract (decide, cheap to isolate) | own-layer Go test with `httptest` in addition to seam 2 | each allowlist member kept, a credential header dropped; `204`, `400` |
+| Compose/Dockerfile/YAML plumbing | none of its own | covered by seam 2 |
+
+## Checks
+
+### S1 - #2 report computes O0 validity · greenfield · ~12k
+
+**C1** - `harness report` on a complete run dir writes `report.json` with `scenario_id`, `run_id` and `tiers.O0.verdict == "PASS"`
+Proof: `go test ./cmd/harness -run '^TestReportO0CompletePass$'`
+
+**C2** - A `seq` with no producer row sets `verdict == "INVALID"` and lists `{"seq":…, "side":"producer"}` in `tiers.O0.missing`
+Proof: `go test ./cmd/harness -run '^TestReportO0MissingProducerInvalid$'`
+
+**C3** - A missing expected consumer row (two consumers on one topic, one row absent) sets `INVALID` and names that consumer service and `seq` in `missing`
+Proof: `go test ./cmd/harness -run '^TestReportO0FanOutMissingConsumerInvalid$'`
+
+**C4** - Duplicate consumer rows with the same `(seq, service, span_id)` leave O0 `PASS` and set `tiers.O0.deduped` to the duplicate count; a redelivery (same seq and service, different `span_id`) also leaves `PASS`
+Proof: `go test ./cmd/harness -run '^TestReportO0DedupAndRedelivery$'`
+
+**C5** - A bridge chain (producer seq 1 -> `bridge_in` 1 -> `bridge_out` seq 2 with `parent_seq` 1 -> consumer seq 2) is `PASS`, and the report names the bridge service as the true producer of the consumer row (`tiers.O0.true_producers["<consumer>/2"] == "<bridge service>"`)
+Proof: `go test ./cmd/harness -run '^TestReportO0BridgeChain$'`
+
+**C6** - Invalid scenarios exit non-zero with an error naming the problem and write no `report.json`: unknown key, missing `id`, unknown `role`, consumer without `topic`, bridge without `from`/`to`
+Proof: `go test ./cmd/harness -run '^TestReportRejectsInvalidScenario$'` (table-driven over the 5 cases)
+
+### S2 - #9 report.html and diff · greenfield · ~8k
+
+**C7** - `harness report` writes `report.html` rendered from `report.json` alone: deleting the ledger after `report.json` exists and re-rendering (`harness report --html-only <dir>`) yields the same HTML
+Proof: `go test ./cmd/harness -run '^TestReportHTMLFromJSONOnly$'`
+
+**C8** - `report.html` contains the scenario id, the agent version from `stack`, and each tier name with its verdict token
+Proof: `go test ./cmd/harness -run '^TestReportHTMLShowsTiers$'`
+
+**C9** - `harness diff a b` prints JSON whose `tiers.O0.verdict` is `["PASS","INVALID"]` when they differ and lists changed truth leaves as `{"path","a","b"}`; identical reports produce `{"tiers":{}}`
+Proof: `go test ./cmd/harness -run '^TestDiffPerTier$'`
+
+### S3 - #3 K0 end to end, dd-java · greenfield · ~40k
+
+**C10** - The recorder stores only allowlisted headers (a `DD-Api-Key` header is not in the meta) and forwards body bytes and path unchanged to the upstream
+Proof: `go test ./internal/services -run '^TestRecorderAllowlistAndForward$'`
+
+**C11** - The ledger collector returns `204` for a valid row array and appends to `ledger/<service>.jsonl`; returns `400` for an undecodable body
+Proof: `go test ./internal/services -run '^TestLedgerCollectorContract$'`
+
+**C12** - The fake intake stores each request and returns `200`
+Proof: `go test ./internal/services -run '^TestFakeIntakeStores$'`
+
+**C13** - `harness run scenarios/k0.yaml` creates `runs/<run_id>/` with the `run_id` shape above, and two runs get different ids
+Proof: `go test -tags e2e ./e2e -run '^TestK0$' -timeout 30m` (asserts dir + id regex; second id checked against the first run's)
+
+**C14** - The K0 report has `tiers.O0.verdict == "PASS"`, ≥1 file in `recorder/` and ≥1 in `intake/`
+Proof: `go test -tags e2e ./e2e -run '^TestK0$' -timeout 30m`
+
+**C15** - Every consumer ledger row's `seq` matches the body marker the producer wrote, and no Kafka header on received records carries `akt` (checked by the consumer, which fails the row with `marker_in_headers:true` if present; the e2e asserts no row has it)
+Proof: `go test -tags e2e ./e2e -run '^TestK0$' -timeout 30m`
+
+**C16** - Producer rows carry `native_id.partition`/`offset` from `RecordMetadata` (every producer row has an offset, offsets unique per partition)
+Proof: `go test -tags e2e ./e2e -run '^TestK0$' -timeout 30m`
+
+**C17** - Ledger delivery does not block sending: the Java ledger client test, with the collector returning `503` for 5 s, sends 100 messages through the client in under 1 s and delivers all 100 rows after the collector recovers
+Proof: `mvn -f apps/java -q test -Dtest=LedgerClientTest#nonBlockingWithRetries`
+
+**C18** - Every image in the generated compose file carries an explicit tag that is not `latest`
+Proof: `go test ./internal/stack -run '^TestComposePinsImages$'`
+
+### S4 - #4 decode payloads, O1/O1v truth · greenfield · ~25k
+
+**C19** - `AgentPayload` bodies decode for each `Content-Encoding` in {identity, gzip, zstd} and for both `tracerPayloads` and `idxTracerPayloads`
+Proof: `go test ./cmd/harness -run '^TestReportDecodesEncodingsAndIdx$'` (table over 3 encodings x 2 variants)
+
+**C20** - A ledger 128-bit trace ID matches a captured span whose low 64 bits are `trace_id` and high 64 are `_dd.p.tid`; with `_dd.p.tid` absent it matches on low 64 bits; a span with the same low 64 but a different `_dd.p.tid` does not match
+Proof: `go test ./cmd/harness -run '^TestReportTraceID128Rule$'`
+
+**C21** - Certain orphans (ledger consumer span that is root, `parent_id == 0`, in its captured chunk) are counted in `tiers.O1.truth.groups[]` keyed `destination x service x broker`, with `rung1`, `rung2`, `not_repairable` per the Repairable truth row
+Proof: `go test ./cmd/harness -run '^TestReportO1CertainOrphansRepairableSplit$'` (one orphan per class, plus one non-orphan)
+
+**C22** - `tiers.O1v.truth.groups[]` holds producer and consumer span volume per `destination x service x broker`; two redeliveries of one seq count as 2 consumer spans
+Proof: `go test ./cmd/harness -run '^TestReportO1vVolumeCountsRedeliveries$'`
+
+**C23** - Ledger rows whose span is absent from captures are counted in `tiers.O1.truth.uncaptured`, not as orphans
+Proof: `go test ./cmd/harness -run '^TestReportO1Uncaptured$'`
+
+**C24** - K0 baseline reports `tiers.O1.truth.total == 0` and `uncaptured == 0`
+Proof: `go test -tags e2e ./e2e -run '^TestK0$' -timeout 30m`
+
+### S5 - #5 K1 OTel Java via OTLP ingest · ~15k
+
+**C25** - Tracer and version are applied at launch from the scenario (`dd-java@1.66.0` / `otel-java@2.31.1` agent jar passed as `-javaagent`), one app image for both
+Proof: `go test ./internal/stack -run '^TestComposeTracerAtLaunch$'`
+
+**C26** - The agent gets `DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT`/`HTTP_ENDPOINT` only when some topology entry uses an OTel tracer
+Proof: `go test ./internal/stack -run '^TestComposeOTLPOnlyWhenNeeded$'`
+
+**C27** - K1 report: `O0 == PASS`, `O1.truth.total == 0`, `uncaptured == 0` (the consumer ref is the per-record span)
+Proof: `go test -tags e2e ./e2e -run '^TestK1$' -timeout 30m`
+
+**C28** - `facts.span_tags[]` has one entry per ledger service x side with `component` and the messaging tag keys seen (so the K1 report records whether `messaging.kafka.offset` survived OTLP ingest)
+Proof: `go test ./cmd/harness -run '^TestReportFactsSpanTags$'`
+Proof: `go test -tags e2e ./e2e -run '^TestK1$' -timeout 30m` (asserts a producer entry exists and its keys are recorded)
+
+### S6 - #6 bridge and K2 · ~20k
+
+**C29** - The bridge writes `bridge_in` for the consumed seq, then `bridge_out` with a new seq, `parent_seq` = consumed seq, and that new seq in the outgoing marker
+Proof: `go test -tags e2e ./e2e -run '^TestK2DdJava$' -timeout 30m` (every `bridge_out` has a `bridge_in` with seq = its `parent_seq`; consumer seqs == bridge_out seqs)
+
+**C30** - K2 dd-java: `O0 == PASS` and `O1.truth.total` equals the number of `bridge_out` rows, all in the `orders-copy x <consumer> x kafka` group, all `rung2`
+Proof: `go test -tags e2e ./e2e -run '^TestK2DdJava$' -timeout 30m`
+
+**C31** - K2 OTel: `O0 == PASS` and `O1.truth.total` equals the `bridge_out` count, all `rung1`
+Proof: `go test -tags e2e ./e2e -run '^TestK2Otel$' -timeout 30m`
+
+### S7 - #7 K3 and O2 truth · ~15k
+
+**C32** - A non-root consumer span whose `parent_id` is absent from recorder captures received in `[anchor - window_ms, anchor + lookahead_ms]` (anchor = its request's `ts_ns`) is a dangling parent; a parent captured inside the window is not
+Proof: `go test ./cmd/harness -run '^TestReportO2Window$'` (parent at window edge inside, 1 ms outside, look-ahead)
+
+**C33** - A dangling parent is `lost_parent` when the consumer trace ID equals its true producer's ledger trace ID, else `unknown_parent`
+Proof: `go test ./cmd/harness -run '^TestReportO2Classification$'`
+
+**C34** - `tiers.O2.full_run` splits dangling parents into `late` (captured after the window, within the run) and `never_captured`, with verdict `REPORTED`
+Proof: `go test ./cmd/harness -run '^TestReportO2FullRunSplit$'`
+
+**C35** - The scenario loader accepts `expect.O2{tolerance, window_ms, lookahead_ms}` and rejects a negative `window_ms`
+Proof: `go test ./cmd/harness -run '^TestReportRejectsInvalidScenario$'` (added case) and `^TestReportO2Window$`
+
+**C36** - K3 baseline (tracer-side sampling on the producer) reports `O0 == PASS` and `O2.truth.lost_parent > 0`
+Proof: `go test -tags e2e ./e2e -run '^TestK3$' -timeout 30m`
+
+### S8 - #8 fixtures · ~10k
+
+**C37** - `harness record scenarios/k2-dd-java.yaml` writes `fixtures/k2-dd-java/` with `recorder/`, `ledger/`, `scenario.yaml` and `manifest.json` holding every manifest field in Landing
+Proof: `go test ./cmd/harness -run '^TestPromoteFixtureManifest$'` (promotion from a hand-built run dir)
+
+**C38** - No file under `fixtures/` contains `DD-Api-Key` (case-insensitive), the dummy key value used by the stack, or the value of `LOCALSTACK_AUTH_TOKEN` when set
+Proof: `go test ./fixtures -run '^TestFixtureHygiene$'`
+
+**C39** - A committed `fixtures/k2-dd-java/manifest.json` has `o0 == "PASS"` and `truth.O1.total` equal to its ledger's `bridge_out` row count
+Proof: `go test ./fixtures -run '^TestK2FixtureManifest$'`
+
+### S9 - #10 K4 rate sweep, K5 LogAppendTime, rung-2 candidates · ~15k
+
+**C40** - The rung-2 true candidate set of a consumer is the captured messaging-producer spans on the same topic whose `[start - w, end + w]` contains `consumer.start - record_queue_time_ms` (w = `rung2.candidate_window_ms`); reported as `tiers.rung2.truth.consumers[]{seq, n, true_producer_in_set}`
+Proof: `go test ./cmd/harness -run '^TestReportRung2CandidateSet$'` (0, 1 and 3 candidates; w widens 1 case in)
+
+**C41** - `tiers.rung2.truth.by_phase[]` gives `{rate_per_s, n_min, n_p50, n_max}` using the seq ranges of `traffic.phases`
+Proof: `go test ./cmd/harness -run '^TestReportRung2ByPhase$'`
+
+**C42** - K4 runs 3 rate phases (5, 50, 500 msg/s) and reports exactly one `by_phase` entry per phase, each with `n_min >= 0`
+Proof: `go test -tags e2e ./e2e -run '^TestK4$' -timeout 45m`
+
+**C43** - Topic configs from `topics.<name>.config` are applied at topic creation (compose creates the topic with them)
+Proof: `go test ./internal/stack -run '^TestComposeTopicConfig$'`
+
+**C44** - K5 (`message.timestamp.type=LogAppendTime`) reports `tiers.rung2.truth.derivation_failed` = count of consumers whose true producer is not in the candidate set; the e2e asserts O0 PASS and the field is present
+Proof: `go test -tags e2e ./e2e -run '^TestK5$' -timeout 30m`
+
+### S10 - #11 K6 clock skew · ~8k
+
+**C45** - `clock_offset: "+5s"` on a Java entry sets `LD_PRELOAD` to libfaketime and `FAKETIME="+5s"` in that container only
+Proof: `go test ./internal/stack -run '^TestComposeClockOffset$'`
+
+**C46** - The report carries `tiers.rung2.truth.skew{declared_ms, consumers_outside_window}`; K6 e2e asserts O0 PASS and `declared_ms == 5000`
+Proof: `go test -tags e2e ./e2e -run '^TestK6$' -timeout 30m`
+
+**C47** - Design.md §10 records the Go-side skew finding (method tried, outcome) and moves it out of "open" if settled
+Proof: `grep -n "Go clock skew" Design.md` shows the finding line, reviewed by the Verifier
+
+### S11 - #12 Go app and K7 · ~30k
+
+**C48** - The Go app supports producer, consumer and bridge and writes the same marker and LedgerRow JSON (a Go ledger client test round-trips a row through the collector and compares to the Java fixture row field set)
+Proof: `go test ./... -run '^TestLedgerRowShape$'` in `apps/go`
+
+**C49** - K7 variants `k7-otel-to-dd` (OTel Java producer, dd-java consumer), `k7-dd-go`, `k7-otel-go` each report `O0 == PASS`
+Proof: `go test -tags e2e ./e2e -run '^TestK7$' -timeout 60m` (subtests per variant)
+
+**C50** - The K7 Go reports' `facts.span_tags` record `component` and messaging tag keys for each Go tracer
+Proof: `go test -tags e2e ./e2e -run '^TestK7$' -timeout 60m`
+
+### S12 - #13 fixtures-v1 · ~5k
+
+**C51** - `fixtures/` holds a set for each of k0, k1, k2-dd-java, k2-otel, k3, k4, k5, k6, k7-otel-to-dd, k7-dd-go, k7-otel-go, each manifest with a `truth` object
+Proof: `go test ./fixtures -run '^TestFixturesV1Complete$'`
+
+**C52** - Hygiene holds over all sets
+Proof: `go test ./fixtures -run '^TestFixtureHygiene$'`
+
+**C53** - Local tag `fixtures-v1` points at the commit that adds the sets
+Proof: `git rev-parse fixtures-v1^{commit}` equals `git log -1 --format=%H -- fixtures/`
+
+## Swept
+
+- validation: C6, C35 (scenario); C11 (ledger body)
+- failure modes: C2, C3 (incomplete ledger -> INVALID, never an Akai Ito failure); C23 (uncaptured spans)
+- idempotency and retry: C4 (dedup, redelivery); C17 (ledger retries)
+- authorization: not in scope - local tool; key hygiene covered by C10, C38
+- concurrency and ordering: C4 (at-least-once consumers); runs isolated per compose project name = run_id (C13)
+- data lifecycle: `runs/` gitignored; fixtures committed only through `record` (C37)
+- external-dependency failure: C17 (collector down); agent retries against intake are the agent's own behaviour
+- state transitions: not in scope - no stateful entity
+- observability: harness prints run_id, run dir and verdict on exit; apps log to container stdout, collected to `runs/<id>/logs/`
+
+## Coverage
+
+| Set (size) | Member -> proof | Unproven |
+| --- | --- | --- |
+| O0 outcomes (5) | complete C1 · missing producer C2 · missing fan-out consumer C3 · duplicate/redelivery C4 · bridge chain C5 | - |
+| scenario rejections (6) | unknown key · missing id · unknown role · consumer no topic · bridge no from/to (all C6) · negative window C35 | - |
+| Content-Encoding x variant (6) | identity/gzip/zstd x tracerPayloads/idx, table in C19 | - |
+| 128-bit rule (3) | tid match · tid absent · tid mismatch (C20) | - |
+| repairable classes (3) | rung1 · rung2 · not_repairable (C21) | - |
+| O2 window edges (3) | inside edge · 1 ms outside · look-ahead (C32) | - |
+| O2 classes (2) | lost C33 · unknown C33 | - |
+| rung-2 candidate counts (3) | 0 · 1 · 3 (C40) | - |
+| recorder allowlist (8 headers + 1 credential) | table in C10 | - |
+| startup config: tracer env (2 assemblies) | compose generator C25 · e2e run C27 | - |
+| report tiers rendered (O0, O1, O1v, O2, rung2) | table in C8 | - |
+| K scenarios (11 variants) | C14 k0 · C27 k1 · C30 k2-dd · C31 k2-otel · C36 k3 · C42 k4 · C44 k5 · C46 k6 · C49 k7 x3 | - |
+
+- Claims naming a status code, route or response shape: C9, C10, C11, C12 - each proof crosses the HTTP or CLI boundary
+- C42 deliberately does not assert N grows with rate: live timing makes it non-deterministic; the distribution is reported
+
+## Handoff
+
+Greenfield, so sizes are estimates of what each slice writes plus the proto package it reads. Batches cut where the surface changes:
+
+- **B1: S1, S2** (~20k) - offline harness only, `cmd/harness` + `internal/{scenario,oracle,report}`
+- **B2: S3** (~40k + first docker/tracer iteration) - services, stack composer, Java app, e2e harness
+- **B3: S4, S5** (~40k) - decoder and O1 truth, then OTel launch; both read the decoder
+- **B4: S6, S7, S8** (~45k) - bridge, K3/O2, fixtures: the M0 exit criterion
+- **B5: S9, S10** (~25k) - rung-2 truth and skew, same oracle surface
+- **B6: S11** (~30k) - Go app, new module
+- **B7: S12** (~5k) - record all sets, tag
