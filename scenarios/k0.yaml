@@ -1,0 +1,9 @@
+id: k0
+broker: kafka
+topology:
+  - {role: producer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
+  - {role: consumer, lang: java, tracer: dd-java, version: "1.66.0", topic: orders}
+topics:
+  orders: {partitions: 3}
+traffic: {messages: 200, rate_per_s: 20}
+expect: {O0: PASS}

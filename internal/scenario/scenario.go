@@ -249,3 +249,23 @@ func (e Entry) ReadSide() string {
 	}
 	return "consumer"
 }
+
+// Phases returns traffic.phases, or the single phase given by traffic.messages/rate_per_s.
+func (s *Scenario) Phases() []Phase {
+	if len(s.Traffic.Phases) > 0 {
+		return s.Traffic.Phases
+	}
+	if s.Traffic.Messages == 0 {
+		return nil
+	}
+	return []Phase{{Messages: s.Traffic.Messages, RatePerS: s.Traffic.RatePerS}}
+}
+
+// Messages is the number of messages each producer entry sends.
+func (s *Scenario) Messages() int {
+	n := 0
+	for _, p := range s.Phases() {
+		n += p.Messages
+	}
+	return n
+}

@@ -88,10 +88,7 @@ func Validity(s *scenario.Scenario, rows []ledger.Row) (O0, []ledger.Row) {
 		}
 	}
 	expected := map[int64]scenario.Entry{}
-	n := s.Traffic.Messages
-	for _, p := range s.Traffic.Phases {
-		n += p.Messages
-	}
+	n := s.Messages()
 	for i, e := range s.Topology {
 		if e.Role != scenario.Producer {
 			continue
