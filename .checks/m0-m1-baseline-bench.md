@@ -37,6 +37,7 @@ One Go module at the root (`github.com/gutrovalim/akaiito-application-test`): `c
 | Headerless bridge | `forward_headers: false` = new `ProducerRecord` with no headers **and** the tracer's own Kafka propagation disabled on the bridge (`DD_KAFKA_CLIENT_PROPAGATION_ENABLED=false`, `OTEL_INSTRUMENTATION_KAFKA_PRODUCER_PROPAGATION_ENABLED=false`) | not copying headers only - the tracer re-injects its own, so nothing breaks |
 | Default sampling | every app runs with 100% keep (`DD_TRACE_SAMPLE_RATE=1.0` / `OTEL_TRACES_SAMPLER=always_on`) unless the scenario sets `sampling` | agent default rates - silently drop healthy traces and make controls noisy |
 | Pinned versions | agent `datadog/agent:7.83.2`, Kafka `apache/kafka:4.3.1`, dd-java `1.66.0`, OTel Java agent `2.31.1`, `kafka-clients 4.3.1`; every new dependency at least 7 days old | `latest` - T14 forbids it |
+| dd-java Kafka producer native id | dd-trace-java tags the Kafka producer span with `partition` and `offset` from `RecordMetadata` as of **v1.62.0** (`KafkaProducerCallback.onCompletion`, upstream PR #11107, merged 2026-04-16), and the advice wraps the callback unconditionally, so an app-side callback cannot change it; `KafkaDecorator.onProduce` still sets only the topic and an explicitly set partition, which is what the design's verified fact was read from. K2's dd-java variant therefore runs a pinned **v1.61.1** (no producer native id, rung 2 only) and a pinned **v1.62.0** (rung 1) pair | a "no callback" variant - the advice replaces the callback, so it would behave identically and prove nothing |
 | Go app tracers | Kafka via `IBM/sarama`; dd-trace-go v2 `contrib/IBM/sarama`, OTel via `github.com/dnwe/otelsarama`; tracer picked by `AKT_TRACER` env at init | confluent-kafka-go - cgo and librdkafka on arm64 images |
 | Stack file and run_id | `stack.json` = `{"agent_version":"7.83.2","kafka_version":"4.3.1","tracers":[{"service","tracer","version"}]}`, copied verbatim into `report.json` `stack` (`{}` when absent); the report's `run_id` = basename of the run dir | `run_id` read from ledger rows - an empty ledger would leave the report without an id |
 | Service name | a topology entry's service = `name` if set, else `akt-<role>`; auto names shared by several entries become `akt-<role>-<topology index>` (0-based); duplicate services rejected; ledger rows carry exactly this | always suffixing the index - every single-producer report would read `akt-producer-0` |
@@ -53,6 +54,11 @@ One Go module at the root (`github.com/gutrovalim/akaiito-application-test`): `c
 | Agent endpoint isolation | the "Agent env" row's `DD_DD_URL` catches the main forwarder only; EvP tracks (netpath, container lifecycle/image, sbom, synthetics, DSM, orchestrator explorer) use their own `*.datadoghq.com` URLs, so each is disabled explicitly (`DD_NETWORK_PATH_ENABLED`, `DD_CONTAINER_LIFECYCLE_ENABLED`, `DD_CONTAINER_IMAGE_ENABLED`, `DD_SBOM_*_ENABLED`, `DD_SYNTHETICS_COLLECTOR_ENABLED`, `DD_DATA_STREAMS_ENABLED`, `DD_ORCHESTRATOR_EXPLORER_ENABLED`, `DD_AGENT_TELEMETRY_ENABLED`), and the guarantee is the run's compose network, which is `internal: true` so no container can egress at all | leaving them on - each one posts to a real Datadog host with the dummy key, and the noise hides the APM traffic F9 must compare byte for byte |
 | Residual agent traffic | the full agent image always starts the process agent and data plane (s6 "features detected from environment"), so `DD_PROCESS_CONFIG_PROCESS_DD_URL=http://metrics:8080` points them at our own sink instead of the internet; `failed to post` in `logs/agent.log` is the egress check (0 on a healthy run) | fighting the image's init - the process agent cannot be env-disabled, and its payloads reach only the fake sink, where the meta path and auth key stay available to F12 |
 | Run dir contents | the run dir also holds `compose.yaml` (the generated stack), `metrics/` and `logs/` (per-service container logs plus `build.log`) | regenerating the compose file at report time - the artifact must show the stack that actually ran |
+| Payload decoder | one package, `internal/trace`: `Decode(body, contentEncoding) ([]Span, error)` over `datadog-agent/pkg/proto` `pbgo/trace` + `pbgo/trace/idx` (v0.83.2), handling identity/gzip/zstd and both tracer-payload variants; `Span` exposes ids as 128-bit hex (`%016x` low half plus `Meta["_dd.p.tid"]` when present), `Meta`, `Metrics` and a `String`/`Int` accessor pair that reads both maps | reading only `Meta` - the Kafka join keys (`partition`, `offset`, `record.queue_time_ms`) live in the numeric `Metrics` map, so a Meta-only decoder sees no join key at all |
+| Capture reader | one package, `internal/captures`, reusing `services.Meta` as the on-disk meta contract; `ReadTraces(dir)` returns every capture with its spans, and non-trace paths with none | a second meta struct in the reader - the writer and reader would drift |
+| O1 truth shape | `{total, uncaptured, trace_id_mismatch, groups[]}`, each group `{destination, service, broker, total, rung1, rung2, not_repairable}` | counting orphans without the rung split - the design's census is reported per rung |
+| O1v truth shape | `{groups[]}`, each `{destination, service, broker, producers, consumers}` | a single span count per service - producer and consumer volume are separate columns in the census |
+| Trace-id mismatch | O1 truth carries `trace_id_mismatch`, the count of read rows whose ledger `trace_id` disagrees with the captured span under the 128-bit rule | comparing inside a test helper - the rule belongs where the join happens, and a mismatch is evidence of an app or tracer id bug |
 
 - Nothing else in this change is hard to reverse
 
@@ -168,8 +174,11 @@ Proof: `go test -tags e2e ./e2e -run '^TestK1$' -timeout 30m` (asserts a produce
 **C29** - The bridge writes `bridge_in` for the consumed seq, then `bridge_out` with a new seq, `parent_seq` = consumed seq, and that new seq in the outgoing marker
 Proof: `go test -tags e2e ./e2e -run '^TestK2DdJava$' -timeout 30m` (every `bridge_out` has a `bridge_in` with seq = its `parent_seq`; consumer seqs == bridge_out seqs)
 
-**C30** - K2 dd-java: `O0 == PASS` and `O1.truth.total` equals the number of `bridge_out` rows, all in the `orders-copy x <consumer> x kafka` group, all `rung2`
-Proof: `go test -tags e2e ./e2e -run '^TestK2DdJava$' -timeout 30m`
+**C30** - K2 dd-java pinned at v1.61.1: `O0 == PASS` and `O1.truth.total` equals the number of `bridge_out` rows, all in the `orders-copy x <consumer> x kafka` group, all `rung2`
+Proof: `go test -tags e2e ./e2e -run '^TestK2DdJavaPreOffset$' -timeout 30m`
+
+**C30b** - K2 dd-java pinned at v1.62.0: `O0 == PASS`, `O1.truth.total` equals the `bridge_out` count, all `rung1` (renegotiated with the user on 2026-09-27: #6 asked for "rung 2 only", which v1.62.0 falsifies)
+Proof: `go test -tags e2e ./e2e -run '^TestK2DdJavaPostOffset$' -timeout 30m`
 
 **C31** - K2 OTel: `O0 == PASS` and `O1.truth.total` equals the `bridge_out` count, all `rung1`
 Proof: `go test -tags e2e ./e2e -run '^TestK2Otel$' -timeout 30m`
@@ -243,7 +252,7 @@ Proof: `go test -tags e2e ./e2e -run '^TestK7$' -timeout 60m`
 
 ### S12 - #13 fixtures-v1 · ~5k
 
-**C51** - `fixtures/` holds a set for each of k0, k1, k2-dd-java, k2-otel, k3, k4, k5, k6, k7-otel-to-dd, k7-dd-go, k7-otel-go, each manifest with a `truth` object
+**C51** - `fixtures/` holds a set for each of k0, k1, k2-dd-java-pre, k2-dd-java-post, k2-otel, k3, k4, k5, k6, k7-otel-to-dd, k7-dd-go, k7-otel-go, each manifest with a `truth` object
 Proof: `go test ./fixtures -run '^TestFixturesV1Complete$'`
 
 **C52** - Hygiene holds over all sets
@@ -279,7 +288,7 @@ Proof: `git rev-parse fixtures-v1^{commit}` equals `git log -1 --format=%H -- fi
 | recorder allowlist (8 headers + 1 credential) | table in C10 | - |
 | startup config: tracer env (2 assemblies) | compose generator C25 · e2e run C27 | - |
 | report tiers rendered (O0, O1, O1v, O2, rung2) | table in C8 | - |
-| K scenarios (11 variants) | C14 k0 · C27 k1 · C30 k2-dd · C31 k2-otel · C36 k3 · C42 k4 · C44 k5 · C46 k6 · C49 k7 x3 | - |
+| K scenarios (12 variants) | C14 k0 · C27 k1 · C30 k2-dd-pre · C30b k2-dd-post · C31 k2-otel · C36 k3 · C42 k4 · C44 k5 · C46 k6 · C49 k7 x3 | - |
 
 - Claims naming a status code, route or response shape: C9, C10, C11, C12 - each proof crosses the HTTP or CLI boundary
 - C42 deliberately does not assert N grows with rate: live timing makes it non-deterministic; the distribution is reported
@@ -315,3 +324,11 @@ Greenfield, so sizes are estimates of what each slice writes plus the proto pack
   - The agent does not emit the `idx` variant for these tracers yet, so C19's idx path needs a hand-built fixture rather than a K0 capture.
   - One trace of 200 (seq 114, both sides) never reached the recorder, with no tracer or agent drop logged, at sampling priority 2 throughout. Treat it as the uncaptured case C23 counts rather than as an orphan, and expect a small non-zero `uncaptured` on live runs.
 - Abandoned: per-feature agent disable flags as the egress fix (kept only where they cut work); a standalone 45 s agent probe as evidence (too short to see the startup validation).
+
+### After B3
+
+- Boundary: C19-C23 closed at the B3 commit (decoder, capture reader, O1/O1v truth). C24 is **not built** - see below.
+- C24 asks for `uncaptured == 0` on K0, and that is not a property the bench can assert: across five K0 runs, four had `uncaptured = 0` and one lost a whole trace (both its producer and its consumer span, seq 114, sampling priority 2 throughout, no tracer or agent drop logged). The tracer's own stats payloads for that run report 200 `akt.send` and 200 `kafka.produce` spans, so the loss is between the tracer and the recorder, not in the app. The proposal is to assert `O1.truth.total == 0` (the control claim) and leave `uncaptured` as a reported number. Waiting on the user.
+- Facts recorded: `/api/v0.2/stats` bodies are **msgpack** (`Content-Type: application/msgpack`), not protobuf, so a stats decoder needs the generated `UnmarshalMsg`; M0/M1 do not decode stats at all. The agent sends 6 trace payloads for a 200-message K0 run, zstd-encoded, and never the `idx` variant, so C19's idx path is proven from a hand-built fixture.
+- Settled mid-build: `oracle.Truth` takes the O0 result because the true producer of a read row is O0's bridge-aware answer, not the reader's own service. `repair` reads the producer span as the producer-kind child of the ledger producer span.
+- Abandoned: `TestDiffPerTier`'s assertion that only O0 differs between two runs - C9 never claimed that, and it now fails correctly because O1v volume really does differ. The test asserts instead that a tier with no difference is omitted, which is what C9 does say.
