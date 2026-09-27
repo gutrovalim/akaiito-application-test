@@ -285,3 +285,9 @@ Greenfield, so sizes are estimates of what each slice writes plus the proto pack
 - **B5: S9, S10** (~25k) - rung-2 truth and skew, same oracle surface
 - **B6: S11** (~30k) - Go app, new module
 - **B7: S12** (~5k) - record all sets, tag
+
+### After B1
+
+- Boundary: C1-C9 closed at 6d9302a (loader 3f9c7bd); `run`/`record` return "not implemented" (exit 1); O1, O1v, O2, rung2 are placeholders `{"verdict":"REPORTED","truth":{}}` for B3+ to fill; C35's negative `window_ms` rejection already exists, its test case does not.
+- Settled mid-build: `harness report` exits 0 whenever report.json is written, whatever the verdict (1 error, 2 usage); a run dir without `ledger/` is an error, an empty ledger is vacuously PASS (no traffic-based expected seqs yet); ledger rows with an unknown `side` are an error; a missing writer is reported as `side:"producer"` even when the expected writer is a bridge, with `service` filled only when exactly one topology entry writes that destination; LedgerRow Go type lives in `internal/ledger` for the collector to reuse.
+- Abandoned: recording empty objects/arrays as diff leaves - produced `{"path":"missing","a":[],"b":null}` noise next to the real `missing[0].seq` change.
